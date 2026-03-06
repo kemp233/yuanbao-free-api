@@ -1,36 +1,41 @@
-# 1. 使用 Python 3.10 基础镜像
-FROM python:3.10-slim
+name: Build and Push Docker Image (Node.js version)
 
-# 设置环境变量，确保安装过程不弹出交互窗口
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: 
 
-WORKDIR /app
+permissions:
+  contents: read
+  packages: write
 
-# 2. 只安装最基础的系统工具和 OpenCV 核心库
-# libgl1 和 libglib2.0-0 是 OpenCV 运行的刚需
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    libgl1 \
-    libglib2.0-0 \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-# 3. 安装 Python 依赖
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-# 4. 【核心修复】让 Playwright 自己安装它需要的系统依赖
-# 这一步会自动补全你刚才报错中缺失的 libnss3, libatk 等几十个库
-RUN python -m playwright install chromium
-RUN python -m playwright install-deps chromium
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-# 5. 复制项目代码
-COPY . .
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-# 暴露端口
-EXPOSE 8000
-
-# 启动程序
-CMD ["python", "app.py"]
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # 编译 amd64(电脑) 和 arm64(Armbian)
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
