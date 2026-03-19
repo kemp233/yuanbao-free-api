@@ -9,7 +9,7 @@ from sse_starlette.sse import EventSourceResponse
 from src.config import settings
 from src.dependencies.auth import get_authorized_headers
 from src.schemas.chat import ChatCompletionRequest, YuanBaoChatCompletionRequest
-from src.services.chat.completion import create_completion_stream
+#from src.services.chat.completion import create_completion_stream
 from src.services.chat.conversation import create_conversation
 from src.utils.chat import get_model_info, parse_messages
 
