@@ -1,94 +1,77 @@
-"""聊天接口模块"""
-
 import logging
 import json
-import asyncio
+import time
 from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
-
-# 1. 顶部仅导入基础配置和工具函数（确保 utils 优先加载）
 from src.config import settings
 from src.dependencies.auth import get_authorized_headers
 from src.schemas.chat import ChatCompletionRequest, YuanBaoChatCompletionRequest
-from src.utils.chat import get_model_info, parse_messages
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-async def clean_stream_generator(original_generator):
+async def clean_stream_generator(original_generator, model_name):
     """
-    清洗生成器：适配 Cherry Studio 折叠效果并清洗 JSON
+    强制 OpenAI 格式化生成器
     """
     is_thinking = False
-    thought_started = False
-
+    
     async for chunk in original_generator:
+        # 处理结束标记
         if chunk == "[DONE]":
-            yield chunk
+            yield "[DONE]"
             continue
 
         try:
-            # 尝试解析 JSON 字符串
-            openai_obj = json.loads(chunk)
-            if "choices" in openai_obj and openai_obj["choices"]:
-                delta = openai_obj["choices"][0].get("delta", {})
-                content_str = delta.get("content", "")
+            # 1. 尝试解析。如果 chunk 本身已经是包装好的 OpenAI 格式，先拆开
+            inner_str = chunk
+            if '"choices"' in chunk:
+                temp_obj = json.loads(chunk)
+                inner_str = temp_obj["choices"][0]["delta"].get("content", "")
 
-                # 识别并处理嵌套的元宝 JSON
-                if content_str and content_str.strip().startswith("{"):
-                    try:
-                        inner = json.loads(content_str)
-                        msg_type = inner.get("type")
-                        clean_text = ""
+            # 2. 如果内容不是 JSON 结构（如 [DONE] 或 纯文字），尝试直接包装
+            if not inner_str.strip().startswith("{"):
+                # 如果是 Cherry Studio 发出的非 JSON 杂质（如 status），直接跳过
+                continue
 
-                        if msg_type == "think":
-                            t_content = inner.get("content", "")
-                            if not thought_started:
-                                clean_text = f"<thought>\n{t_content}"
-                                thought_started = True
-                                is_thinking = True
-                            else:
-                                clean_text = t_content
-                        
-                        elif msg_type == "text":
-                            t_msg = inner.get("msg", "")
-                            if is_thinking:
-                                # 思考结束，闭合标签
-                                clean_text = f"\n</thought>\n\n{t_msg}"
-                                is_thinking = False
-                            else:
-                                clean_text = t_msg
-                        
-                        elif msg_type in ["tips", "meta"]:
-                            clean_text = ""
+            # 3. 解析腾讯原始 JSON
+            inner_json = json.loads(inner_content_str if 'inner_content_str' in locals() else inner_str)
+            msg_type = inner_json.get("type")
+            clean_text = ""
 
-                        openai_obj["choices"][0]["delta"]["content"] = clean_text
-                        yield json.dumps(openai_obj, ensure_ascii=False)
-                        continue
+            if msg_type == "think":
+                text = inner_json.get("content", "")
+                clean_text = f"<thought>\n{text}" if not is_thinking else text
+                is_thinking = True
+            elif msg_type == "text":
+                text = inner_json.get("msg", "")
+                clean_text = f"\n</thought>\n\n{text}" if is_thinking else text
+                is_thinking = False
+            else:
+                continue # 忽略 tips, meta 等
 
-                    except json.JSONDecodeError:
-                        pass
+            # 4. 强制构造 OpenAI 格式发给客户端
+            openai_packet = {
+                "choices": [{"delta": {"content": clean_text}, "finish_reason": None}],
+                "model": model_name,
+                "created": int(time.time())
+            }
+            yield json.dumps(openai_packet, ensure_ascii=False)
 
-            yield json.dumps(openai_obj, ensure_ascii=False)
-        except Exception:
-            yield chunk
+        except Exception as e:
+            continue
 
 @router.post("/v1/chat/completions")
-async def chat_completions(
-    request: ChatCompletionRequest,
-    headers: dict = Depends(get_authorized_headers),
-):
-    """聊天完成接口"""
-    # 2. 【关键】将业务服务逻辑移入函数内部，彻底阻断循环导入链
+async def chat_completions(request: ChatCompletionRequest, headers: dict = Depends(get_authorized_headers)):
     from src.services.chat.completion import create_completion_stream
     from src.services.chat.conversation import create_conversation
+    from src.utils.chat import get_model_info, parse_messages
 
     try:
-        # 强制创建新对话 (如果你需要上下文记忆，可以改回 if not request.chat_id)
+        # 强制创建新会话避免超长报错
         request.chat_id = await create_conversation(settings.agent_id, headers)
-        
         prompt = parse_messages(request.messages)
-        model_info = get_model_info(request.model) or {"model": "hy_deepseek_r1", "support_functions": []}
+        model_info = get_model_info(request.model)
 
         chat_request = YuanBaoChatCompletionRequest(
             agent_id=settings.agent_id,
@@ -100,8 +83,12 @@ async def chat_completions(
         )
 
         raw_gen = create_completion_stream(chat_request, headers, request.should_remove_conversation)
-        return EventSourceResponse(clean_stream_generator(raw_gen), media_type="text/event-stream")
         
+        # 这里的关键：无论底层发什么，我们都通过包装器保证输出是 OpenAI 格式
+        return EventSourceResponse(
+            clean_stream_generator(raw_gen, request.model), 
+            media_type="text/event-stream"
+        )
     except Exception as e:
-        logger.error(f"Chat error: {e}")
+        logger.error(f"Endpoint Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
