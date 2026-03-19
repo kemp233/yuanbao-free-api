@@ -44,10 +44,15 @@ class BrowserManager:
             self.playwright = await async_playwright().start()
 
         if self.browser is None:
-            self.browser = await self.playwright.chromium.launch(headless=True)
+            # 增加一些规避检测的参数
+            self.browser = await self.playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
 
         if self.page is None:
-            self.page = await self.browser.new_page()
+            # 设置视口大小确保元素可见
+            self.page = await self.browser.new_page(viewport={'width': 1280, 'height': 800})
             await self._load_page()
 
     async def _load_page(self):
@@ -55,64 +60,101 @@ class BrowserManager:
         logger.info("[Browser] 预加载 Yuanbao 页面...")
         try:
             await self.page.goto(settings.page_url, timeout=settings.page_timeout)
-            await self.page.wait_for_timeout(3000)
+            # 等待网络空闲，确保脚本加载完成
+            await self.page.wait_for_load_state("networkidle")
+            
+            # 尝试通过 ESC 键关闭可能存在的初始公告/协议弹窗
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(2)
+            
             logger.info("[Browser] 页面加载完成")
         except Exception as e:
             logger.error(f"[Browser] 页面加载失败: {e}")
             raise
 
     async def login(self) -> Dict:
-        """执行登录流程，返回二维码信息
-
-        Returns:
-            Dict: 登录结果字典
-        """
+        """执行登录流程，返回二维码信息"""
         await self.ensure_browser()
 
         try:
-            login_button = self.page.get_by_role("img").first
-            await login_button.wait_for(state="visible")
-            await login_button.click()
+            # 1. 检测登录对话框是否已经弹出
+            # 腾讯 TDesign 的弹窗通常带有 t-dialog 或 t-portal 类名
+            login_dialog_selector = ".t-dialog, .t-portal, [class*='login']"
+            is_dialog_visible = await self.page.locator(login_dialog_selector).first.is_visible(timeout=3000)
 
-            iframe_frame = self.page.frame_locator("iframe")
-            qrcode_locator = iframe_frame.get_by_role("img")
+            if not is_dialog_visible:
+                logger.info("[Browser] 未检测到登录框，尝试点击触发登录...")
+                # 使用 force=True 强制点击，防止被不可见的遮罩层拦截
+                login_trigger = self.page.get_by_role("img").first
+                await login_trigger.click(force=True)
+                await asyncio.sleep(2)
+            else:
+                logger.info("[Browser] 登录对话框已在页面显示")
+
+            # 2. 寻找二维码图片
+            # 尝试多种可能的选择器（主页面图片、Canvas、或者 iframe 内）
+            qr_selectors = [
+                "img[src*='qrcode']", 
+                ".t-dialog img", 
+                "canvas", 
+                ".login-qrcode img"
+            ]
+            
+            qrcode_locator = None
+            for selector in qr_selectors:
+                loc = self.page.locator(selector).first
+                if await loc.is_visible(timeout=2000):
+                    qrcode_locator = loc
+                    logger.info(f"[Browser] 成功通过选择器找到二维码: {selector}")
+                    break
+
+            # 如果主页面没找到，尝试原有的 iframe 逻辑
+            if not qrcode_locator:
+                logger.info("[Browser] 主页面未直接找到二维码，尝试检索 iframe...")
+                iframe_frame = self.page.frame_locator("iframe")
+                qrcode_locator = iframe_frame.get_by_role("img").first
+
+            # 3. 等待二维码并处理
             await qrcode_locator.wait_for(state="visible", timeout=10000)
-
             await qrcode_locator.screenshot(path=settings.qrcode_path)
             logger.info(f"[Browser] 二维码已保存至 {settings.qrcode_path}")
 
+            # 打印二维码到终端
             print_qr_to_terminal(settings.qrcode_path)
 
-            logger.info("[Browser] 等待扫码完成...")
+            logger.info("[Browser] 请扫描终端显示的二维码进行登录...")
+
+            # 4. 等待登录成功（检测登录框消失）
             try:
-                await login_button.wait_for(state="detached", timeout=settings.login_timeout)
-                logger.info("[Browser] 扫码成功，按钮已消失")
+                # 监测刚才那个对话框消失，认为登录成功
+                await self.page.locator(login_dialog_selector).first.wait_for(
+                    state="detached", 
+                    timeout=settings.login_timeout
+                )
+                logger.info("[Browser] 扫码成功，登录对话框已关闭")
                 self._is_logged_in = True
                 return {
                     "success": True,
                     "message": "登录成功",
                     "qrcode_path": settings.qrcode_path,
                 }
-            except TimeoutError:
-                logger.warning("[Browser] 扫码超时或未检测到登录成功")
+            except Exception:
+                logger.warning("[Browser] 扫码超时或页面未响应登录状态")
                 return {
                     "success": False,
                     "message": "扫码超时",
                     "qrcode_path": settings.qrcode_path,
                 }
+
         except Exception as e:
-            logger.error(f"[Browser] 登录失败: {e}")
+            logger.error(f"[Browser] 登录失败详情: {e}")
             return {
                 "success": False,
                 "message": f"登录失败: {str(e)}",
             }
 
     async def get_headers(self) -> Optional[Dict]:
-        """获取请求头
-
-        Returns:
-            Optional[Dict]: 请求头字典，失败返回 None
-        """
+        """获取请求头 (逻辑保持不变)"""
         await self.ensure_browser()
         captured_headers = {}
 
@@ -130,7 +172,7 @@ class BrowserManager:
 
         if self._route_handler:
             try:
-                self.page.remove_route("**/*")
+                await self.page.unroute("**/*")
             except Exception:
                 pass
 
@@ -138,28 +180,25 @@ class BrowserManager:
         self._route_handler = handle_route
 
         try:
-            reload_task = asyncio.create_task(self.page.reload(timeout=10000))
-
+            # 刷新页面以触发 API 请求并捕获 headers
+            reload_task = asyncio.create_task(self.page.reload(timeout=15000))
             start_time = asyncio.get_event_loop().time()
 
             while (asyncio.get_event_loop().time() - start_time) < settings.header_timeout:
                 if captured_headers.get("x-uskey"):
                     break
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.1)
 
             if captured_headers.get("x-uskey"):
-                reload_task.cancel()
-                try:
-                    await reload_task
-                except asyncio.CancelledError:
-                    pass
-
+                if not reload_task.done():
+                    reload_task.cancel()
+            
         except Exception as e:
             logger.error(f"[Browser] 获取请求头失败: {e}")
         finally:
             if self._route_handler:
                 try:
-                    self.page.remove_route("**/*")
+                    await self.page.unroute("**/*")
                     self._route_handler = None
                 except Exception:
                     pass
@@ -167,16 +206,10 @@ class BrowserManager:
         return captured_headers if captured_headers.get("x-uskey") else None
 
     async def get_cookies(self) -> Dict[str, str]:
-        """获取 Cookie
-
-        Returns:
-            Dict[str, str]: Cookie 字典
-        """
+        """获取 Cookie"""
         await self.ensure_browser()
-
         if not self.page:
             return {}
-
         cookies = await self.page.context.cookies()
         return {c["name"]: c["value"] for c in cookies}
 
