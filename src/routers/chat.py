@@ -6,16 +6,18 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
+# 1. 顶部仅导入基础配置和工具函数（确保 utils 优先加载）
 from src.config import settings
 from src.dependencies.auth import get_authorized_headers
 from src.schemas.chat import ChatCompletionRequest, YuanBaoChatCompletionRequest
+from src.utils.chat import get_model_info, parse_messages
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 async def clean_stream_generator(original_generator):
     """
-    清洗生成器：适配 Cherry Studio 折叠效果
+    清洗生成器：适配 Cherry Studio 折叠效果并清洗 JSON
     """
     is_thinking = False
     thought_started = False
@@ -26,12 +28,14 @@ async def clean_stream_generator(original_generator):
             continue
 
         try:
+            # 尝试解析 JSON 字符串
             openai_obj = json.loads(chunk)
             if "choices" in openai_obj and openai_obj["choices"]:
                 delta = openai_obj["choices"][0].get("delta", {})
                 content_str = delta.get("content", "")
 
-                if content_str and content_str.startswith("{"):
+                # 识别并处理嵌套的元宝 JSON
+                if content_str and content_str.strip().startswith("{"):
                     try:
                         inner = json.loads(content_str)
                         msg_type = inner.get("type")
@@ -49,6 +53,7 @@ async def clean_stream_generator(original_generator):
                         elif msg_type == "text":
                             t_msg = inner.get("msg", "")
                             if is_thinking:
+                                # 思考结束，闭合标签
                                 clean_text = f"\n</thought>\n\n{t_msg}"
                                 is_thinking = False
                             else:
@@ -74,13 +79,12 @@ async def chat_completions(
     headers: dict = Depends(get_authorized_headers),
 ):
     """聊天完成接口"""
-    # 延迟导入，防止循环依赖
+    # 2. 【关键】将业务服务逻辑移入函数内部，彻底阻断循环导入链
     from src.services.chat.completion import create_completion_stream
     from src.services.chat.conversation import create_conversation
-    from src.utils.chat import get_model_info, parse_messages
 
     try:
-        # 强制创建新对话
+        # 强制创建新对话 (如果你需要上下文记忆，可以改回 if not request.chat_id)
         request.chat_id = await create_conversation(settings.agent_id, headers)
         
         prompt = parse_messages(request.messages)
