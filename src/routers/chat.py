@@ -6,7 +6,6 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
-# 仅保留基础库和配置在顶部导入
 from src.config import settings
 from src.dependencies.auth import get_authorized_headers
 from src.schemas.chat import ChatCompletionRequest, YuanBaoChatCompletionRequest
@@ -16,7 +15,7 @@ router = APIRouter()
 
 async def clean_stream_generator(original_generator):
     """
-    深度优化：适配 Cherry Studio 折叠效果并清洗 JSON
+    清洗生成器：适配 Cherry Studio 折叠效果
     """
     is_thinking = False
     thought_started = False
@@ -75,7 +74,7 @@ async def chat_completions(
     headers: dict = Depends(get_authorized_headers),
 ):
     """聊天完成接口"""
-    # 【修复循环导入】将导致循环的导入移入函数内部
+    # 延迟导入，防止循环依赖
     from src.services.chat.completion import create_completion_stream
     from src.services.chat.conversation import create_conversation
     from src.utils.chat import get_model_info, parse_messages
