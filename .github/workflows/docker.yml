@@ -5,11 +5,12 @@ on:
     branches: [ "main" ]
   workflow_dispatch: 
 
-# 确保拥有写入 Packages 的权限
+# 核心权限声明
 permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write  # 增加：包证明权限
 
 jobs:
   build:
@@ -18,10 +19,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 【关键修复】将仓库名转换为全小写，否则推送会报权限错误
+      # 强制转换全小写（包括用户名和仓库名）
       - name: Lowercase repo name
         id: repo_name
-        run: echo "img_save_name=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+        run: |
+          echo "img_save_name=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -37,17 +39,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6 # 升级到 v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          # 编译 amd64(电脑) 和 arm64(Armbian/树莓派)
           platforms: linux/amd64,linux/arm64
-          # 使用处理后的小写名称
           tags: |
             ghcr.io/${{ steps.repo_name.outputs.img_save_name }}:latest
             ghcr.io/${{ steps.repo_name.outputs.img_save_name }}:${{ github.sha }}
-          # 开启缓存，下次编译会快很多
+          # 缓存设置，防止重复拉取重复编译
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # 允许在推送失败时提供更多诊断信息
+          provenance: false
