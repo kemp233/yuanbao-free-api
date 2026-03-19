@@ -5,9 +5,11 @@ on:
     branches: [ "main" ]
   workflow_dispatch: 
 
+# 确保拥有写入 Packages 的权限
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   build:
@@ -15,6 +17,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # 【关键修复】将仓库名转换为全小写，否则推送会报权限错误
+      - name: Lowercase repo name
+        id: repo_name
+        run: echo "img_save_name=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -35,7 +42,12 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          # 编译 amd64(电脑) 和 arm64(Armbian)
+          # 编译 amd64(电脑) 和 arm64(Armbian/树莓派)
           platforms: linux/amd64,linux/arm64
+          # 使用处理后的小写名称
           tags: |
-            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ steps.repo_name.outputs.img_save_name }}:latest
+            ghcr.io/${{ steps.repo_name.outputs.img_save_name }}:${{ github.sha }}
+          # 开启缓存，下次编译会快很多
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
